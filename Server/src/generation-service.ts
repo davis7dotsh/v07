@@ -25,7 +25,7 @@ import type { components } from "./generated/api.ts";
 import { API_VERSION } from "./api.ts";
 import { decodePersonalDictionary } from "./domain/dictionary.ts";
 import { validateBody } from "./validation.ts";
-import type { InferenceBackend } from "./inference/native-inference.ts";
+import type { InferenceBackend, KeptRange } from "./inference/native-inference.ts";
 import { InferenceError } from "./inference/inference-error.ts";
 import { ServiceError } from "./errors.ts";
 import {
@@ -45,12 +45,36 @@ import {
 import { cleanTranscript } from "./domain/cleaner.ts";
 import { composeDictation } from "./domain/composition.ts";
 import { formatSpokenList } from "./domain/lists.ts";
+import { findPause } from "./domain/pauses.ts";
 import { evaluateCorrectionInWorker } from "./domain/correction-runtime.ts";
 import { maxInputCharacters, modelHints, processingRecord } from "./domain/correction.ts";
 
 const MAX_METADATA_BYTES = 1_048_576;
 const MAX_PREFERENCES_BYTES = 262_144;
 const MAX_CHUNK_BYTES = 1_048_576;
+/** Silero scores 512-frame (32 ms) windows of 16 kHz inference audio. */
+const VAD_WINDOW_FRAMES = 512;
+/** Look for a pause each time this much new audio arrives. */
+const STREAM_STEP_FRAMES = 16_000;
+/** Silero restarts per request, so this much earlier audio is re-scored as warmup. */
+const STREAM_WARMUP_FRAMES = 32 * VAD_WINDOW_FRAMES;
+/**
+ * Shortest stretch recognized on its own. Shorter pieces recognized measurably
+ * worse (more misheard words) while saving only a few tenths of a second.
+ */
+const STREAM_MINIMUM_WINDOWS = Math.ceil((8 * 16_000) / VAD_WINDOW_FRAMES);
+/** Without a pause as long as the speaker's usual ones, cut at the longest pause by then. */
+const STREAM_MAXIMUM_WINDOWS = Math.ceil((30 * 16_000) / VAD_WINDOW_FRAMES);
+/**
+ * Parakeet hears this much audio before and after each piece and keeps only the
+ * piece's own words, which brings pieces closer to a whole-take pass. Much more
+ * context costs CPU while recording without recognizing better.
+ */
+const STREAM_CONTEXT_FRAMES = 4 * 16_000;
+const STREAM_LOOKAHEAD_FRAMES = 2 * 16_000;
+/** The speech helper rejects WAV files shorter than 0.2 seconds. */
+const MINIMUM_ENGINE_FRAMES = 4_000;
+const STREAM_FILES = ["speech-window.wav", "speech-piece.wav", "speech-tail.wav"];
 const terminal = (record: GenerationRecord) =>
   ["completed", "failed", "cancelled"].includes(record.status);
 const now = () => new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
@@ -147,6 +171,7 @@ function normalizePreferences(
 interface ServiceConfiguration {
   dataDirectory: string;
   development: boolean;
+  streamSpeech?: boolean;
 }
 interface Upload {
   format: AudioStreamFormat;
@@ -158,6 +183,97 @@ interface Watcher {
   wake?: () => void;
   done: boolean;
 }
+/** Speech recognized while a take is still uploading. */
+interface SpeechStream {
+  /** Inference frames already covered by `pieces`. */
+  committed: number;
+  pieces: string[];
+  /** Inference frames already scored by Silero. */
+  scored: number;
+  /** Silero probabilities for scored windows from `committed` on. */
+  probabilities: number[];
+  task?: Promise<void>;
+  closed: boolean;
+}
+
+function wavHeader(bytes: number, sampleRate: number, channels: number) {
+  const header = Buffer.alloc(44);
+  header.write("RIFF");
+  header.writeUInt32LE(bytes + 36, 4);
+  header.write("WAVEfmt ", 8);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(3, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(sampleRate * channels * 4, 28);
+  header.writeUInt16LE(channels * 4, 32);
+  header.writeUInt16LE(32, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(bytes, 40);
+  return header;
+}
+
+/** Copies mono float32 frames [start, end) to a WAV file, padding silence up to `minimum` frames. */
+async function writeSpeechRange(
+  source: string,
+  dataOffset: number,
+  start: number,
+  end: number,
+  destination: string,
+  minimum = 0,
+) {
+  const data = Buffer.alloc(Math.max(end - start, minimum) * 4);
+  const input = await open(
+    source,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const { bytesRead } = await input.read(data, 0, (end - start) * 4, dataOffset + start * 4);
+    if (bytesRead !== (end - start) * 4) throw new Error("Audio ended before it could be copied.");
+  } finally {
+    await input.close();
+  }
+  await rm(destination, { force: true });
+  const output = await open(
+    destination,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    await output.writeFile(Buffer.concat([wavHeader(data.length, 16_000, 1), data]));
+  } finally {
+    await output.close();
+  }
+}
+
+/** Joins recognized pieces; punctuation that ends a sentence across a cut attaches to it. */
+function joinPieces(pieces: string[]) {
+  let text = "";
+  for (const piece of pieces.map((piece) => piece.trim()).filter(Boolean))
+    text = !text ? piece : /^[.,!?;:]/u.test(piece) ? text + piece : `${text} ${piece}`;
+  return text;
+}
+
+/** Parakeet takes one request at a time; sealed takes go before streamed pieces. */
+class SpeechSlot {
+  private busy = false;
+  private readonly waiting: { urgent: boolean; resume: () => void }[] = [];
+  async run<T>(urgent: boolean, task: () => Promise<T>): Promise<T> {
+    if (this.busy)
+      await new Promise<void>((resume) => {
+        const index = urgent ? this.waiting.findIndex((entry) => !entry.urgent) : -1;
+        this.waiting.splice(index < 0 ? this.waiting.length : index, 0, { urgent, resume });
+      });
+    this.busy = true;
+    try {
+      return await task();
+    } finally {
+      const next = this.waiting.shift();
+      if (next) next.resume();
+      else this.busy = false;
+    }
+  }
+}
 
 /** All durable mutations share one queue. Model work proceeds outside it. */
 export class GenerationService {
@@ -166,6 +282,8 @@ export class GenerationService {
   private uploads = new Map<string, Partial<Record<AudioKind, Upload>>>();
   private processingControllers = new Map<string, AbortController>();
   private processingQueue: Promise<void> = Promise.resolve();
+  private streams = new Map<string, SpeechStream>();
+  private readonly speechSlot = new SpeechSlot();
   private warmController?: AbortController;
   private warmTask?: Promise<void>;
   private warming = false;
@@ -621,6 +739,8 @@ export class GenerationService {
       this.uploads.set(id, streams);
       record.updatedAt = now();
       this.records.set(id, record);
+      if (kind === "inference" && this.configuration.streamSpeech)
+        this.streamSpeech(id, upload.bytes / 4);
       return {
         nextSequence: upload.chunks.length,
         frameCount: upload.bytes / (format.channels * 4),
@@ -947,20 +1067,9 @@ export class GenerationService {
         0o600,
       );
       try {
-        const header = Buffer.alloc(44);
-        header.write("RIFF");
-        header.writeUInt32LE(upload.bytes + 36, 4);
-        header.write("WAVEfmt ", 8);
-        header.writeUInt32LE(16, 16);
-        header.writeUInt16LE(3, 20);
-        header.writeUInt16LE(upload.format.channels, 22);
-        header.writeUInt32LE(upload.format.sampleRate, 24);
-        header.writeUInt32LE(upload.format.sampleRate * upload.format.channels * 4, 28);
-        header.writeUInt16LE(upload.format.channels * 4, 32);
-        header.writeUInt16LE(32, 34);
-        header.write("data", 36);
-        header.writeUInt32LE(upload.bytes, 40);
-        await output.writeFile(header);
+        await output.writeFile(
+          wavHeader(upload.bytes, upload.format.sampleRate, upload.format.channels),
+        );
         const buffer = Buffer.alloc(MAX_CHUNK_BYTES);
         let offset = 0;
         while (offset < upload.bytes) {
@@ -1044,16 +1153,7 @@ export class GenerationService {
       });
       if (!record) return;
       const settings = record.settings.preferences;
-      const speech = await this.inference.transcribe(
-        join(this.directory(id), "inference.wav"),
-        settings.language,
-        // Parakeet has no vocabulary prompt; dictionary rules apply after recognition.
-        [],
-        (value) => {
-          void this.mutate(() => this.progress(id, value));
-        },
-        signal,
-      );
+      const speech = await this.recognize(id, record, signal);
       signal.throwIfAborted();
       record.rawText = speech.text;
       record.detectedLanguage = speech.language === "auto" ? undefined : speech.language;
@@ -1137,6 +1237,163 @@ export class GenerationService {
         await this.save(failed).catch(() => this.publish(failed));
       });
     }
+  }
+
+  /**
+   * Transcribes a sealed take. Pieces recognized while it was uploading are
+   * reused, so only the audio after the last streamed pause is left to process.
+   */
+  private async recognize(id: string, record: GenerationRecord, signal: AbortSignal) {
+    const started = performance.now();
+    const stream = this.streams.get(id);
+    this.streams.delete(id);
+    // A piece already in progress finishes and is kept.
+    await stream?.task;
+    if (stream) stream.closed = true;
+    const directory = this.directory(id);
+    const transcribe = (path: string, keep?: KeptRange) =>
+      this.speechSlot.run(true, () =>
+        this.inference.transcribe(
+          path,
+          record.settings.preferences.language,
+          // Parakeet has no vocabulary prompt; dictionary rules apply after recognition.
+          [],
+          (value) => {
+            void this.mutate(() => this.progress(id, value));
+          },
+          signal,
+          keep,
+        ),
+      );
+    if (!stream?.pieces.length || !record.inferenceAudio)
+      return transcribe(join(directory, "inference.wav"));
+    const tail = join(directory, "speech-tail.wav");
+    const from = Math.max(0, stream.committed - STREAM_CONTEXT_FRAMES);
+    try {
+      await writeSpeechRange(
+        join(directory, "inference.wav"),
+        44,
+        from,
+        record.inferenceAudio.frameCount,
+        tail,
+        MINIMUM_ENGINE_FRAMES,
+      );
+      const waited = (performance.now() - started) / 1000;
+      const speech = await transcribe(tail, { from: (stream.committed - from) / 16_000 });
+      return {
+        ...speech,
+        text: joinPieces([...stream.pieces, speech.text]),
+        // The wait after recording: the unfinished piece plus the tail.
+        processingSeconds: waited + speech.processingSeconds,
+      };
+    } finally {
+      await rm(tail, { force: true });
+    }
+  }
+
+  /** Starts recognizing finished stretches of a take while it is still uploading. */
+  private streamSpeech(id: string, available: number) {
+    if (this.stopping) return;
+    let stream = this.streams.get(id);
+    if (!stream) {
+      stream = {
+        committed: 0,
+        pieces: [],
+        scored: 0,
+        probabilities: [],
+        closed: false,
+      };
+      this.streams.set(id, stream);
+    }
+    if (stream.closed || stream.task || available - stream.scored < STREAM_STEP_FRAMES) return;
+    const current = stream;
+    current.task = this.speechSlot
+      .run(false, () => this.advanceStream(id, current))
+      .catch(() => {
+        // Streaming is an optimization: the sealed take covers whatever is left.
+        current.closed = true;
+      })
+      .finally(() => {
+        current.task = undefined;
+      });
+  }
+
+  /** Scores new audio for speech and recognizes the stretch before the next natural pause. */
+  private async advanceStream(id: string, stream: SpeechStream) {
+    const directory = this.directory(id);
+    const window = join(directory, "speech-window.wav");
+    const scored = await this.mutate(() =>
+      this.copyUploadedSpeech(
+        id,
+        stream,
+        Math.max(stream.committed, stream.scored - STREAM_WARMUP_FRAMES),
+        undefined,
+        window,
+      ),
+    );
+    if (!scored) return;
+    try {
+      const activity = await this.inference.detectSpeech(window);
+      if (Math.round(activity.frameSeconds * 16_000) !== VAD_WINDOW_FRAMES)
+        throw new Error("Speech detection used an unexpected window size.");
+      stream.probabilities.push(
+        ...activity.probabilities.slice((stream.scored - scored.start) / VAD_WINDOW_FRAMES),
+      );
+      stream.scored = scored.end;
+    } finally {
+      await rm(window, { force: true });
+    }
+    const cut = findPause(stream.probabilities, STREAM_MINIMUM_WINDOWS, STREAM_MAXIMUM_WINDOWS);
+    if (cut === undefined) return;
+    const end = stream.committed + cut * VAD_WINDOW_FRAMES;
+    if (stream.scored < end + STREAM_LOOKAHEAD_FRAMES) return;
+    const from = Math.max(0, stream.committed - STREAM_CONTEXT_FRAMES);
+    const piece = join(directory, "speech-piece.wav");
+    const copied = await this.mutate(() =>
+      this.copyUploadedSpeech(id, stream, from, end + STREAM_LOOKAHEAD_FRAMES, piece),
+    );
+    if (!copied) return;
+    try {
+      const speech = await this.inference.transcribe(
+        piece,
+        copied.language,
+        [],
+        undefined,
+        undefined,
+        {
+          from: (stream.committed - from) / 16_000,
+          until: (end - from) / 16_000,
+        },
+      );
+      if (stream.closed) return;
+      stream.pieces.push(speech.text.trim());
+      stream.probabilities.splice(0, cut);
+      stream.committed = end;
+    } finally {
+      await rm(piece, { force: true });
+    }
+  }
+
+  /**
+   * Copies uploaded inference audio [start, end) to a WAV file while the take is
+   * still receiving. Without `end`, copies every whole VAD window uploaded so far.
+   * Runs inside mutate().
+   */
+  private async copyUploadedSpeech(
+    id: string,
+    stream: SpeechStream,
+    start: number,
+    end: number | undefined,
+    destination: string,
+  ) {
+    const record = this.records.get(id);
+    const upload = this.uploads.get(id)?.inference;
+    if (this.stopping || stream.closed || record?.status !== "receiving" || !upload) return;
+    const available = upload.bytes / 4;
+    end ??= start + Math.floor((available - start) / VAD_WINDOW_FRAMES) * VAD_WINDOW_FRAMES;
+    if (end > available || end - start < MINIMUM_ENGINE_FRAMES) return;
+    await writeSpeechRange(join(this.directory(id), "inference.raw"), 0, start, end, destination);
+    return { start, end, language: record.settings.preferences.language };
   }
 
   private async proofread(
@@ -1233,11 +1490,16 @@ export class GenerationService {
   }
   private async cleanPartial(id: string) {
     this.uploads.delete(id);
+    const stream = this.streams.get(id);
+    this.streams.delete(id);
+    if (stream) stream.closed = true;
     for (const name of [
       "inference.raw",
       "original.raw",
       "inference.wav.partial",
       "original.wav.partial",
+      // An active piece removes its own files once the helper is done with them.
+      ...(stream?.task ? [] : STREAM_FILES),
     ])
       await rm(join(this.directory(id), name), { force: true }).catch(() => {});
   }

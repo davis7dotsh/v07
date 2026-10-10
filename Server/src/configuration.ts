@@ -13,16 +13,21 @@ export interface ServerConfiguration {
   dataDirectory: string;
   token?: string;
   development: boolean;
+  /** --stream-speech or INLAY_STREAM_SPEECH=1: recognize finished speech while a take uploads. */
+  streamSpeech: boolean;
   inference: InferenceConfiguration;
 }
 
 export const usage = `Inlay server — independent dictation service
 inlay-server --data-dir PATH --speech-helper PATH --speech-model PATH --vad-model PATH \
   --proof-helper PATH --proof-model PATH [--host 127.0.0.1] [--port 8391] [--token-file PATH] [--dev]
+  [--stream-speech]
 
 macOS uses Parakeet/Metal and Qwen/MLX. Linux uses Parakeet/CUDA or CPU and Qwen/llama.cpp.
 Models must already exist. The server never downloads or imports personal data automatically.
 Use persistent storage for --data-dir. Remote bindings require --token-file.
+--stream-speech recognizes speech between natural pauses while a take uploads, so only the
+last few seconds remain after release. It trades a little accuracy for a much shorter wait.
 `;
 
 const names = new Set([
@@ -48,10 +53,15 @@ export async function parseConfiguration(
 ) {
   const options = new Map<string, string>();
   let development = environment.INLAY_DEV === "1";
+  let streamSpeech = environment.INLAY_STREAM_SPEECH === "1";
   for (let index = 0; index < args.length; index++) {
     const argument = args[index]!;
     if (argument === "--dev") {
       development = true;
+      continue;
+    }
+    if (argument === "--stream-speech") {
+      streamSpeech = true;
       continue;
     }
     const name = argument.slice(2);
@@ -110,6 +120,7 @@ export async function parseConfiguration(
     port,
     token,
     development,
+    streamSpeech,
     dataDirectory: path("data-dir", "INLAY_SERVER_DATA_DIR"),
     inference: createInferenceConfiguration({
       speechHelper: path("speech-helper", "INLAY_ENGINE_PATH"),

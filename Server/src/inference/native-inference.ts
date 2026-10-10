@@ -69,6 +69,19 @@ export interface SpeechInferenceResult {
   hints?: ModelHintUsage;
 }
 
+export interface SpeechActivity {
+  /** Silero speech probability per VAD window, in order. */
+  probabilities: number[];
+  frameSeconds: number;
+  processingSeconds: number;
+}
+
+/** Recognize the whole file as context but return only words starting in [from, until) seconds. */
+export interface KeptRange {
+  from: number;
+  until?: number;
+}
+
 export interface ProofInferenceResult {
   text: string;
   processingSeconds: number;
@@ -85,7 +98,9 @@ export interface InferenceBackend {
     vocabularyTerms: string[],
     onProgress?: (value: number) => void,
     signal?: AbortSignal,
+    keep?: KeptRange,
   ): Promise<SpeechInferenceResult>;
+  detectSpeech(audioPath: string, signal?: AbortSignal): Promise<SpeechActivity>;
   correct(
     text: string,
     terms: string[],
@@ -257,6 +272,7 @@ export class NativeInference implements InferenceBackend {
     vocabularyTerms: string[],
     onProgress?: (value: number) => void,
     signal?: AbortSignal,
+    keep?: KeptRange,
   ): Promise<SpeechInferenceResult> {
     checkCancellation(signal);
     let readable = true;
@@ -276,7 +292,9 @@ export class NativeInference implements InferenceBackend {
           term !== term.trim() ||
           /[\p{Cc}\p{Cf}]/u.test(term),
       ) ||
-      vocabularyTerms.reduce((total, term) => total + bytes(term), 0) > 384 * 1024
+      vocabularyTerms.reduce((total, term) => total + bytes(term), 0) > 384 * 1024 ||
+      (keep !== undefined &&
+        !(keep.from >= 0 && (keep.until === undefined || keep.until > keep.from)))
     ) {
       throw new InferenceError("invalidRequest", "Audio, language, or Parakeet prompt is invalid.");
     }
@@ -293,6 +311,7 @@ export class NativeInference implements InferenceBackend {
       path: audioPath,
       language,
       vocabularyTerms,
+      ...(keep ? { keepFrom: keep.from, keepUntil: keep.until } : {}),
     };
     if (bytes(JSON.stringify(request)) >= 1_048_576)
       throw new InferenceError("invalidRequest", "The encoded vocabulary exceeds 1 MB.");
@@ -337,6 +356,33 @@ export class NativeInference implements InferenceBackend {
       ...(digest !== undefined ? { modelSHA256: digest } : {}),
       ...(hints !== undefined ? { hints } : {}),
     };
+  }
+
+  async detectSpeech(audioPath: string, signal?: AbortSignal): Promise<SpeechActivity> {
+    checkCancellation(signal);
+    const request = { type: "speech", id: randomUUID(), path: audioPath };
+    const response = await this.speech.request(
+      request,
+      request.id,
+      this.configuration.speechTimeout,
+      undefined,
+      signal,
+    );
+    const { probabilities, frameSeconds, duration, elapsed } = response;
+    if (
+      !probabilities ||
+      frameSeconds === undefined ||
+      !(frameSeconds > 0) ||
+      duration === undefined ||
+      probabilities.length !== Math.ceil(duration / frameSeconds - 1e-6) ||
+      elapsed === undefined ||
+      !Number.isFinite(elapsed) ||
+      elapsed < 0
+    ) {
+      await this.speech.shutdown();
+      throw new InferenceError("invalidResponse", "Speech detection returned an invalid result.");
+    }
+    return { probabilities, frameSeconds, processingSeconds: elapsed };
   }
 
   async correct(

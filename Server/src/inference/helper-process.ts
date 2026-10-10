@@ -17,6 +17,8 @@ export interface HelperResponse {
   omittedTerms?: string[];
   tokenCount?: number;
   tokenBudget?: number;
+  probabilities?: number[];
+  frameSeconds?: number;
 }
 
 export interface HelperConfiguration {
@@ -49,7 +51,7 @@ function decodeResponse(line: Buffer): HelperResponse | undefined {
   const response = value as Record<string, unknown>;
   if (typeof response.type !== "string") return;
   const strings = ["id", "message", "text", "language", "engineVersion"];
-  const numbers = ["duration", "elapsed", "value"];
+  const numbers = ["duration", "elapsed", "value", "frameSeconds"];
   const integers = ["tokenCount", "tokenBudget"];
   if (
     strings.some(
@@ -61,6 +63,13 @@ function decodeResponse(line: Buffer): HelperResponse | undefined {
     return;
   if (numbers.some((key) => response[key] != null && typeof response[key] !== "number")) return;
   if (integers.some((key) => response[key] != null && !Number.isSafeInteger(response[key]))) return;
+  const probabilities = response.probabilities;
+  if (
+    probabilities != null &&
+    (!Array.isArray(probabilities) ||
+      probabilities.some((value) => typeof value !== "number" || !(value >= 0 && value <= 1)))
+  )
+    return;
   for (const key of ["includedTerms", "omittedTerms"]) {
     const terms = response[key];
     if (

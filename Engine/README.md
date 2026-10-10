@@ -19,9 +19,12 @@ After loading Parakeet and Silero VAD, the helper emits a `ready` JSON object wi
 - `language` defaults to `en`. Accepts `auto` and the model's 25 supported language codes: `bg`, `hr`, `cs`, `da`, `nl`, `en`, `et`, `fi`, `fr`, `de`, `el`, `hu`, `it`, `lv`, `lt`, `mt`, `pl`, `pt`, `ro`, `sk`, `sl`, `es`, `sv`, `ru`, `uk`. Legacy preferences `ja`, `zh`, `ko`, `hi`, and `ar` also remain accepted for proofreading; they do not expand speech recognition support. Recognition always chooses the spoken language automatically. Results return `language: "auto"` because this runtime exposes no language ID. The server omits detected-language metadata and uses the preference only for Qwen proofreading.
 - `vocabularyTerms` remains accepted and validated for protocol compatibility. Parakeet has no vocabulary prompting API: `includedTerms` is empty, `omittedTerms` contains every supplied term, and `tokenCount` / `tokenBudget` are zero. Dictionary replacements and Qwen hints remain available after recognition.
 - WAV input must be mono 16 kHz PCM16 or float32, 0.2–180 seconds long. The HTTP server uses a 0.25-second minimum.
+- Optional `keepFrom` and `keepUntil` (seconds) recognize the whole file as context but return only words that start inside that range. The server uses them for pieces of a take that is still uploading.
 - Progress: `{"type":"progress","id":"request-1","value":0.5}`. Updates depend on the upstream callback; large encodes can spend time without intermediate progress.
 - Results contain `type: "result"`, `id`, `text`, audio `duration`, processing `elapsed`, `language`, and hint diagnostics.
 - Errors contain `type: "error"`, `message`, and a request `id` when available. Requests are processed sequentially.
+
+`{"type":"speech","id":"request-2","path":"/absolute/path/to/window.wav"}` runs only Silero and returns `probabilities` (one speech probability per 32 ms window), `frameSeconds`, `duration`, and `elapsed`. The server uses it to find natural pauses while a take uploads.
 
 Requests are bounded to 1 MiB. Vocabulary allows at most 8,192 terms, 16 KiB per term, and 384 KiB total. Silence returns a successful empty transcript.
 

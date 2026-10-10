@@ -138,6 +138,9 @@ For server-only development alongside an installed Inlay instance, use `--port 8
 | `--vad-model`                       | `INLAY_VAD_PATH`                                   |
 | `--proof-helper`, `--proof-model`   | `INLAY_TEXT_ENGINE_PATH`, `INLAY_TEXT_MODEL`       |
 | `--dev`                             | `INLAY_DEV=1`                                      |
+| `--stream-speech`                   | `INLAY_STREAM_SPEECH=1`                            |
+
+`--stream-speech` recognizes speech while a take is still uploading. Silero scores each new second of audio; once at least 8 seconds are waiting, the server cuts at the next pause that is at least as long as the speaker's median pause in that stretch, and Parakeet recognizes that piece with 4 seconds of audio before and 2 seconds after it as context. On release, only the audio after the last cut remains, so the wait after a long take drops from a whole-take pass (about 10–13 seconds for 80 seconds of speech on a 6-core CPU) to about a second. Pieces lose the whole-take context, so expect slightly more misheard words, mostly names and jargon. Speech detection costs about 4 ms of CPU per second of audio. Leave it off for best accuracy, or when the server is fast enough that whole-take recognition already feels instant.
 
 The dev runner fixes its host to loopback and defaults to port 8391, `.local/server` for data, and `.local/server.log` for logs. Set `INLAY_SPEECH_MODEL` and `INLAY_TEXT_MODEL` when using the paths above. Without those overrides, macOS searches `~/Library/Application Support/Inlay/Models/ggml-parakeet-tdt-0.6b-v3-f16.bin` and `~/.inlay/models/Qwen3-4B-Instruct-2507-MLX-4bit`. Existing installations can retain their archive, token file, and Qwen model location with the arguments or overrides above, but must install the Parakeet weights; see [upgrade guidance](../README.md#upgrade-an-existing-installation).
 

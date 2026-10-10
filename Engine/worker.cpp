@@ -239,6 +239,22 @@ void transcribe(parakeet_context *context, whisper_vad_context *vad, int threads
         emitError(*failure, *id);
         return;
     }
+    // Optional: recognize the whole file as context, but return only words that
+    // start within [keepFrom, keepUntil) seconds.
+    const auto seconds = [&request](const char *key, double fallback) -> std::optional<double> {
+        const auto field = request.find(key);
+        if (field == request.end()) return fallback;
+        if (!field->is_number()) return std::nullopt;
+        const auto value = field->get<double>();
+        return std::isfinite(value) && value >= 0 ? std::optional<double>(value) : std::nullopt;
+    };
+    const auto keepFrom = seconds("keepFrom", 0);
+    const auto keepUntil = seconds("keepUntil", HUGE_VAL);
+    if (!keepFrom || !keepUntil || *keepFrom >= *keepUntil) {
+        emitError("The kept time range is invalid.", *id);
+        return;
+    }
+    const bool trimmed = request.contains("keepFrom") || request.contains("keepUntil");
 
     const auto start = Clock::now();
     const auto &terms = std::get<std::vector<std::string>>(vocabulary);
@@ -286,7 +302,22 @@ void transcribe(parakeet_context *context, whisper_vad_context *vad, int threads
             return;
         }
         for (int i = 0; i < parakeet_full_n_segments(context); ++i) {
-            text += parakeet_full_get_segment_text(context, i);
+            if (!trimmed) {
+                text += parakeet_full_get_segment_text(context, i);
+                continue;
+            }
+            for (int j = 0; j < parakeet_full_n_tokens(context, i); ++j) {
+                // Token times count 10 ms mel frames.
+                const double time = parakeet_full_get_token_data(context, i, j).t0 * PARAKEET_HOP_LENGTH /
+                                    static_cast<double>(PARAKEET_SAMPLE_RATE);
+                if (time < *keepFrom || time >= *keepUntil) continue;
+                const char *piece = parakeet_full_get_token_text(context, i, j);
+                const int size = parakeet_token_to_text(piece, text.empty(), nullptr, 0);
+                std::string decoded(static_cast<size_t>(std::max(size, 0)) + 1, '\0');
+                parakeet_token_to_text(piece, text.empty(), decoded.data(), static_cast<int>(decoded.size()));
+                decoded.resize(static_cast<size_t>(std::max(size, 0)));
+                text += decoded;
+            }
         }
     }
     reportProgress(nullptr, nullptr, 100, &progress);
@@ -296,6 +327,48 @@ void transcribe(parakeet_context *context, whisper_vad_context *vad, int threads
           // or vocabulary prompting API. Never claim a hint was applied.
           {"language", "auto"}, {"includedTerms", json::array()}, {"omittedTerms", terms},
           {"tokenCount", 0}, {"tokenBudget", 0}});
+}
+
+// Silero scores 512-sample (32 ms) windows at 16 kHz.
+constexpr size_t vadWindowSamples = 512;
+
+// Reports per-window speech probabilities so the server can find natural
+// pauses in a recording that is still being uploaded.
+void detectSpeech(whisper_vad_context *vad, const json &request) {
+    const auto id = stringField(request, "id");
+    if (!id || id->empty() || id->size() > 256) {
+        emitError("A speech detection request needs a nonempty id (up to 256 bytes).");
+        return;
+    }
+    const auto path = stringField(request, "path");
+    if (!path || path->empty() || path->size() > 4096) {
+        emitError("A speech detection request needs a valid WAV path.", *id);
+        return;
+    }
+    const auto start = Clock::now();
+    auto loaded = readAudio(*path);
+    if (const auto failure = std::get_if<std::string>(&loaded)) {
+        emitError(*failure, *id);
+        return;
+    }
+    const auto &audio = std::get<Audio>(loaded);
+    if (!whisper_vad_detect_speech(vad, audio.samples.data(), static_cast<int>(audio.samples.size()))) {
+        emitError("Local speech detection failed.", *id);
+        return;
+    }
+    const auto count = static_cast<size_t>(whisper_vad_n_probs(vad));
+    if (count != (audio.samples.size() + vadWindowSamples - 1) / vadWindowSamples) {
+        emitError("Local speech detection returned an unexpected window count.", *id);
+        return;
+    }
+    const float *probs = whisper_vad_probs(vad);
+    auto probabilities = json::array();
+    for (size_t i = 0; i < count; ++i) {
+        probabilities.push_back(std::round(std::clamp(probs[i], 0.0f, 1.0f) * 1000.0f) / 1000.0);
+    }
+    emit({{"type", "result"}, {"id", *id}, {"probabilities", std::move(probabilities)},
+          {"frameSeconds", static_cast<double>(vadWindowSamples) / PARAKEET_SAMPLE_RATE},
+          {"duration", audio.duration}, {"elapsed", std::chrono::duration<double>(Clock::now() - start).count()}});
 }
 
 } // namespace
@@ -371,11 +444,13 @@ int main(int argc, char **argv) {
         }
         const auto type = stringField(request, "type");
         if (type == "quit") return 0;
-        if (type != "transcribe") {
+        if (type == "speech") {
+            detectSpeech(vad.get(), request);
+        } else if (type == "transcribe") {
+            transcribe(context.get(), vad.get(), threads, request);
+        } else {
             emitError("Unknown request type.", stringField(request, "id").value_or(""));
-            continue;
         }
-        transcribe(context.get(), vad.get(), threads, request);
     }
     if (!std::cin.eof()) {
         emitError("The request exceeds the 1 MB limit.");
